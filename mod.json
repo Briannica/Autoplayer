@@ -1,0 +1,28 @@
+{
+    "geode": "5.11.2",
+    "gd": { "win": "2.2081" },
+    "id": "brainiator.autoplayer",
+    "name": "Autoplayer",
+    "version": "v1.0.0",
+    "developer": "brainiator",
+    "description": "Checkpoint-rewind input search that beats levels in every gamemode.",
+    "settings": {
+        "run-search": {
+            "type": "bool",
+            "name": "Search (enter Practice Mode)",
+            "default": false
+        },
+        "run-replay": {
+            "type": "bool",
+            "name": "Replay saved run (normal mode)",
+            "default": false
+        },
+        "speed": {
+            "type": "float",
+            "name": "Search speed multiplier",
+            "default": 3.0,
+            "min": 1.0,
+            "max": 20.0
+        }
+    }
+}
