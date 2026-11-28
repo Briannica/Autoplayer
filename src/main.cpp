@@ -189,7 +189,8 @@ class $modify(BotLayer, PlayLayer) {
         TraceFrame lastReplayExpected{};                 // expected state for last completed replay update
         TraceFrame lastReplayActual{};                    // actual state for last completed replay update
         bool hasLastReplayActual = false;
-        float trainingTimeScale = 1.f;                  // scheduler scale used while recording
+        float trainingTimeScale = 1.f;                  // scheduler scale requested for the active training session
+        float replayRecordedTimeScale = 1.f;             // metadata only; replay scheduler always runs at 1x
 
         // Hierarchical section training: learn locally with the existing
         // checkpoint search, then validate the entire portal-to-portal section
@@ -386,6 +387,44 @@ class $modify(BotLayer, PlayLayer) {
         return static_cast<bool>(f);
     }
 
+    // The Cocos scheduler time scale is GLOBAL. Keep it enabled only while
+    // search is actively running, and always return it to 1x for ordinary play
+    // and replay. The existing search algorithm remains unchanged.
+    void setSchedulerTimeScale(float requested, const char* reason) {
+        float target = requested;
+        if (!std::isfinite(target) || target <= 0.f) {
+            log::warn(
+                "Autoplayer: invalid scheduler scale {} requested by {}; using 1x",
+                requested, reason
+            );
+            target = 1.f;
+        }
+        target = std::clamp(target, 0.1f, 8.f);
+
+        auto* scheduler = CCDirector::get()->getScheduler();
+        const float actual = scheduler->getTimeScale();
+        if (!std::isfinite(actual) || std::abs(actual - target) > 0.001f) {
+            scheduler->setTimeScale(target);
+            log::info(
+                "Autoplayer: scheduler scale set reason={} old={:.3f} new={:.3f}",
+                reason, actual, target
+            );
+        }
+    }
+
+    void enforceTrainingTimeScale(const char* reason) {
+        if (!m_fields->engaged || !m_fields->started || m_fields->done ||
+            !Mod::get()->getSettingValue<bool>("run-search")) {
+            return;
+        }
+
+        setSchedulerTimeScale(m_fields->trainingTimeScale, reason);
+    }
+
+    void restoreNormalTimeScale(const char* reason) {
+        setSchedulerTimeScale(1.f, reason);
+    }
+
     bool loadTrace() {
         std::ifstream f(traceSavePath(), std::ios::binary);
         if (!f) return false;
@@ -442,7 +481,7 @@ class $modify(BotLayer, PlayLayer) {
         }
 
         m_fields->replayTrace = std::move(loaded);
-        m_fields->trainingTimeScale = savedTimeScale;
+        m_fields->replayRecordedTimeScale = savedTimeScale;
         m_fields->replayUpdate = 0;
         m_fields->replayTraceLoaded = true;
         m_fields->replayTraceLoadAttempted = true;
@@ -894,7 +933,7 @@ class $modify(BotLayer, PlayLayer) {
         m_fields->done = true;
         m_fields->engaged = false;
         m_fields->sectionValidationActive = false;
-        CCDirector::get()->getScheduler()->setTimeScale(1.f);
+        restoreNormalTimeScale("training completed");
 
         log::info(
             "Autoplayer: LEVEL BEATEN after section validation; saved {} chunks and {} player physics updates (input={}, world-X={}, trace={})",
@@ -1806,10 +1845,18 @@ class $modify(BotLayer, PlayLayer) {
             m_fields->sectionStartDepth = 0;
             m_fields->currentModeKey = modeSignature(m_player1);
             m_fields->modeKeyInitialized = true;
-            auto speed = static_cast<float>(Mod::get()->getSettingValue<double>("speed"));
+            const double configuredSpeed = Mod::get()->getSettingValue<double>("speed");
+            float speed = std::isfinite(configuredSpeed)
+                ? static_cast<float>(configuredSpeed)
+                : 1.f;
+            if (!std::isfinite(speed) || speed <= 0.f) speed = 1.f;
+            speed = std::clamp(speed, 0.1f, 8.f);
             m_fields->trainingTimeScale = speed;
-            CCDirector::get()->getScheduler()->setTimeScale(speed);
-            log::info("Autoplayer: search started (speed x{}); section validation enabled", speed);
+            setSchedulerTimeScale(speed, "search start");
+            log::info(
+                "Autoplayer: search started (scheduler x{:.2f}); section validation enabled",
+                speed
+            );
         }
 
         if (m_fields->sectionValidationActive) {
@@ -2038,7 +2085,7 @@ class $modify(BotLayer, PlayLayer) {
         if (m_fields->holding && m_player1) pressButton(false);
         m_fields->holding = false;
         m_fields->replayFinished = true;
-        CCDirector::get()->getScheduler()->setTimeScale(1.f);
+        restoreNormalTimeScale("replay finished");
         log::info(
             "Autoplayer: replay trace ended. physicsUpdates={} divergences={} firstDivergence={} "
             "maxPositionError={:.4f} maxVelocityError={:.4f}",
@@ -2064,9 +2111,13 @@ class $modify(BotLayer, PlayLayer) {
                 return;
             }
 
-            CCDirector::get()->getScheduler()->setTimeScale(m_fields->trainingTimeScale);
-            log::info("Autoplayer: loaded {} physics-step samples at recorded scheduler scale x{}",
-                      m_fields->replayTrace.size(), m_fields->trainingTimeScale);
+            restoreNormalTimeScale("replay start");
+
+            log::info(
+                "Autoplayer: loaded {} physics-step samples; replay scheduler=1x; "
+                "trace was recorded at scheduler x{:.2f}",
+                m_fields->replayTrace.size(), m_fields->replayRecordedTimeScale
+            );
         }
 
         if (!m_fields->replayPrimed) {
@@ -2303,6 +2354,7 @@ public:
         m_fields->holding = false;
 
         PlayLayer::resetLevel();
+        enforceTrainingTimeScale("resetLevel");
         m_fields->rTick = 0;
         m_fields->replayUpdate = 0;
         m_fields->replayPrimed = false;
@@ -2421,7 +2473,7 @@ public:
             m_fields->replayDeathStop = true;
             if (wasHolding) pressButton(false);
             m_fields->holding = false;
-            CCDirector::get()->getScheduler()->setTimeScale(1.f);
+            restoreNormalTimeScale("replay death");
             log::warn(
                 "Autoplayer: REPLAY DEATH physicsUpdate={} x={:.2f} y={:.2f} vy={:.2f} "
                 "ground={} upsideDown={} holding={} percent={:.2f} hitX={:.2f} hitY={:.2f}",
@@ -2466,7 +2518,7 @@ public:
     // trace before the base class tears down the level/player state.
     void onExit() {
         savePartialProgressForReplay();
-        CCDirector::get()->getScheduler()->setTimeScale(1.f);
+        restoreNormalTimeScale("level exit");
         PlayLayer::onExit();
     }
 
@@ -2475,6 +2527,8 @@ public:
         PlayLayer::postUpdate(dt);
         if (!m_player1) return;
         auto* mod = Mod::get();
+        const bool searchEnabled =
+            mod->getSettingValue<bool>("run-search") && !m_fields->done;
 
         const bool replayEnabled = !m_isPracticeMode && mod->getSettingValue<bool>("run-replay");
         if (replayEnabled != m_fields->replayWasEnabled) {
@@ -2495,14 +2549,17 @@ public:
             }
         }
 
-        if (m_fields->physicsStepsSincePostUpdate > 0) {
+        const uint32_t physicsStepsThisFrame = m_fields->physicsStepsSincePostUpdate;
+        if (physicsStepsThisFrame > 0) {
             static int physicsDiagFrames = 0;
             if (++physicsDiagFrames % 240 == 0) {
-                log::info("Autoplayer: last rendered frame contained {} player physics update(s)",
-                          m_fields->physicsStepsSincePostUpdate);
+                log::info(
+                    "Autoplayer: last rendered frame contained {} player physics update(s)",
+                    physicsStepsThisFrame
+                );
             }
-            m_fields->physicsStepsSincePostUpdate = 0;
         }
+        m_fields->physicsStepsSincePostUpdate = 0;
 
         static int tk = 0;
         if (++tk % 960 == 0) {
@@ -2512,10 +2569,33 @@ public:
                       m_fields->done, m_fields->stack.size());
         }
 
-        if (mod->getSettingValue<bool>("run-search") && !m_fields->done) {
+        static int speedDiagnostics = 0;
+
+        if (++speedDiagnostics % 120 == 0) {
+            auto* scheduler = CCDirector::get()->getScheduler();
+            log::info(
+                "Autoplayer: SPEED CHECK searchEnabled={} requested={:.2f} actual={:.2f} "
+                "postUpdateDt={:.6f} playerPhysicsSteps={}",
+                searchEnabled,
+                m_fields->trainingTimeScale,
+                scheduler->getTimeScale(),
+                dt,
+                physicsStepsThisFrame
+            );
+        }
+
+        if (searchEnabled) {
+            // This check repairs a scale change caused by a reset or another
+            // scheduled game callback. searchTick() still owns the old search.
+            enforceTrainingTimeScale("postUpdate");
             searchTick();
             return;
         }
+
+        // Search has been switched off or finished. Never leave the entire game
+        // running at the training multiplier while the user plays normally.
+        restoreNormalTimeScale(m_fields->done ? "search complete" : "search disabled");
+
         if (replayEnabled) replayTick();
     }
 };

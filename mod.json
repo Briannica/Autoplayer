@@ -20,7 +20,7 @@
         "speed": {
             "type": "float",
             "name": "Search speed multiplier",
-            "default": 3.0,
+            "default": 1.0,
             "min": 1.0,
             "max": 20.0
         }
